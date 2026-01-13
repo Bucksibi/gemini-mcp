@@ -7,10 +7,22 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 
 // Constants
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const DEFAULT_MODEL = "gemini-2.5-flash-preview-05-20";
+const MAX_PROMPT_LENGTH = 500000; // ~500K chars, well under Gemini's 1M token limit
+const MAX_CONTENT_LENGTH = 1000000; // 1M chars for summarize (large content)
+
+// Valid Gemini models
+const VALID_MODELS = [
+  "gemini-2.5-flash-preview-05-20",
+  "gemini-2.5-pro-preview-05-06",
+  "gemini-2.0-flash",
+] as const;
+
+type ValidModel = typeof VALID_MODELS[number];
 
 // Types
 interface GeminiMessage {
@@ -37,6 +49,34 @@ interface GeminiResponse {
     code?: number;
   };
 }
+
+// Zod schemas for runtime validation
+const modelSchema = z.string().refine(
+  (val): val is ValidModel => VALID_MODELS.includes(val as ValidModel),
+  { message: `Invalid model. Valid options: ${VALID_MODELS.join(", ")}` }
+).optional();
+
+const analyzeArgsSchema = z.object({
+  prompt: z.string().min(1, "prompt is required and cannot be empty").max(MAX_PROMPT_LENGTH, `prompt exceeds maximum length of ${MAX_PROMPT_LENGTH} characters`),
+  context: z.string().max(MAX_CONTENT_LENGTH, `context exceeds maximum length of ${MAX_CONTENT_LENGTH} characters`).optional(),
+  model: modelSchema,
+});
+
+const chatMessageSchema = z.object({
+  role: z.enum(["user", "model"]),
+  content: z.string().min(1, "message content cannot be empty"),
+});
+
+const chatArgsSchema = z.object({
+  messages: z.array(chatMessageSchema).min(1, "messages array is required and cannot be empty"),
+  model: modelSchema,
+});
+
+const summarizeArgsSchema = z.object({
+  content: z.string().min(1, "content is required and cannot be empty").max(MAX_CONTENT_LENGTH, `content exceeds maximum length of ${MAX_CONTENT_LENGTH} characters`),
+  focus: z.string().max(1000, "focus exceeds maximum length of 1000 characters").optional(),
+  model: modelSchema,
+});
 
 // Get API key from environment
 function getApiKey(): string {
@@ -187,65 +227,48 @@ const tools: Tool[] = [
 ];
 
 // Tool handlers
-async function handleGeminiAnalyze(args: {
-  prompt: string;
-  context?: string;
-  model?: string;
-}): Promise<string> {
-  if (!args.prompt?.trim()) {
-    throw new Error("prompt is required and cannot be empty");
-  }
+async function handleGeminiAnalyze(args: unknown): Promise<string> {
+  const validated = analyzeArgsSchema.parse(args);
 
-  let fullPrompt = args.prompt;
-  if (args.context?.trim()) {
-    fullPrompt = `${args.prompt}\n\n--- Context ---\n${args.context}`;
+  let fullPrompt = validated.prompt;
+  if (validated.context?.trim()) {
+    fullPrompt = `${validated.prompt}\n\n--- Context ---\n${validated.context}`;
   }
 
   const messages: GeminiMessage[] = [
     { role: "user", parts: [{ text: fullPrompt }] },
   ];
 
-  return await callGemini(messages, args.model || DEFAULT_MODEL);
+  return await callGemini(messages, validated.model || DEFAULT_MODEL);
 }
 
-async function handleGeminiChat(args: {
-  messages: { role: "user" | "model"; content: string }[];
-  model?: string;
-}): Promise<string> {
-  if (!args.messages || !Array.isArray(args.messages) || args.messages.length === 0) {
-    throw new Error("messages array is required and cannot be empty");
-  }
+async function handleGeminiChat(args: unknown): Promise<string> {
+  const validated = chatArgsSchema.parse(args);
 
-  const geminiMessages: GeminiMessage[] = args.messages.map((msg) => ({
+  const geminiMessages: GeminiMessage[] = validated.messages.map((msg) => ({
     role: msg.role,
     parts: [{ text: msg.content }],
   }));
 
-  return await callGemini(geminiMessages, args.model || DEFAULT_MODEL);
+  return await callGemini(geminiMessages, validated.model || DEFAULT_MODEL);
 }
 
-async function handleGeminiSummarize(args: {
-  content: string;
-  focus?: string;
-  model?: string;
-}): Promise<string> {
-  if (!args.content?.trim()) {
-    throw new Error("content is required and cannot be empty");
-  }
+async function handleGeminiSummarize(args: unknown): Promise<string> {
+  const validated = summarizeArgsSchema.parse(args);
 
   let prompt = "Please provide a concise summary of the following content:\n\n";
 
-  if (args.focus?.trim()) {
-    prompt = `Please summarize the following content, focusing specifically on: ${args.focus}\n\n`;
+  if (validated.focus?.trim()) {
+    prompt = `Please summarize the following content, focusing specifically on: ${validated.focus}\n\n`;
   }
 
-  prompt += args.content;
+  prompt += validated.content;
 
   const messages: GeminiMessage[] = [
     { role: "user", parts: [{ text: prompt }] },
   ];
 
-  return await callGemini(messages, args.model || DEFAULT_MODEL, 0.5); // Lower temperature for summaries
+  return await callGemini(messages, validated.model || DEFAULT_MODEL, 0.5); // Lower temperature for summaries
 }
 
 // Create and run server
@@ -276,13 +299,13 @@ async function main() {
 
       switch (name) {
         case "gemini_analyze":
-          result = await handleGeminiAnalyze(args as Parameters<typeof handleGeminiAnalyze>[0]);
+          result = await handleGeminiAnalyze(args);
           break;
         case "gemini_chat":
-          result = await handleGeminiChat(args as Parameters<typeof handleGeminiChat>[0]);
+          result = await handleGeminiChat(args);
           break;
         case "gemini_summarize":
-          result = await handleGeminiSummarize(args as Parameters<typeof handleGeminiSummarize>[0]);
+          result = await handleGeminiSummarize(args);
           break;
         default:
           throw new Error(`Unknown tool: ${name}`);
@@ -292,7 +315,15 @@ async function main() {
         content: [{ type: "text", text: result }],
       };
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
+      let errorMessage: string;
+      if (error instanceof z.ZodError) {
+        // Format Zod validation errors nicely
+        errorMessage = error.issues.map((e) => `${e.path.join(".")}: ${e.message}`).join("; ");
+      } else if (error instanceof Error) {
+        errorMessage = error.message;
+      } else {
+        errorMessage = String(error);
+      }
       return {
         content: [{ type: "text", text: `Error: ${errorMessage}` }],
         isError: true,
