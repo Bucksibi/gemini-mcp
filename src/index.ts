@@ -11,14 +11,20 @@ import { z } from "zod";
 
 // Constants
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
-const DEFAULT_MODEL = "gemini-2.5-flash-preview-05-20";
+const DEFAULT_MODEL = "gemini-3-flash-preview";
 const MAX_PROMPT_LENGTH = 500000; // ~500K chars, well under Gemini's 1M token limit
 const MAX_CONTENT_LENGTH = 1000000; // 1M chars for summarize (large content)
 
 // Valid Gemini models
 const VALID_MODELS = [
+  // Gemini 3 models
+  "gemini-3-flash-preview",
+  "gemini-3-pro-preview",
+  "gemini-3-pro-image-preview",
+  // Gemini 2.5 models
   "gemini-2.5-flash-preview-05-20",
   "gemini-2.5-pro-preview-05-06",
+  // Gemini 2.0 models
   "gemini-2.0-flash",
 ] as const;
 
